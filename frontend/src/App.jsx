@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
-import { processHistory, startDemoSession, uploadHistory } from "./api";
+import ProcessingOverlay from "./components/ProcessingOverlay.jsx";
+import { processWithProgress, startDemoSession, uploadHistory } from "./api";
 import InsightsPanel from "./components/InsightsPanel.jsx";
 import UploadScreen from "./components/UploadScreen.jsx";
 import WrappedSlideshow from "./components/WrappedSlideshow.jsx";
@@ -20,6 +21,7 @@ export function buildSlidesFromInsights(insights) {
   const emojis = ["🎬", "🎯", "⭐", "🌙", "🌀", "🔮"];
 
   const topCat = insights?.top_categories?.[0];
+  const feedbackWrong = topCat?.category || "entertainment";
   const total =
     insights?.summary?.total_videos_analyzed ||
     (insights?.top_categories || []).reduce((a, c) => a + (c.count || 0), 0) ||
@@ -118,14 +120,25 @@ export function buildSlidesFromInsights(insights) {
     ];
   }
 
-  return blocks.map((block, i) => ({
-    slideNumber: i + 1,
-    headline: block.headline || "Slide",
-    body: block.lines || block.body || [],
-    stat: block.stat ?? stats[i] ?? null,
-    emoji: block.emoji || emojis[i % emojis.length],
-    gradient: i % 6,
-  }));
+  return blocks.map((block, i) => {
+    const lines = block.lines || block.body || [];
+    const titleSnippet = [block.headline, ...lines]
+      .filter(Boolean)
+      .join(" ")
+      .slice(0, 500);
+    return {
+      slideNumber: i + 1,
+      headline: block.headline || "Slide",
+      body: lines,
+      stat: block.stat ?? stats[i] ?? null,
+      emoji: block.emoji || emojis[i % emojis.length],
+      gradient: i % 6,
+      feedback: {
+        title: titleSnippet,
+        wrongCategory: feedbackWrong,
+      },
+    };
+  });
 }
 
 export default function App() {
@@ -133,27 +146,54 @@ export default function App() {
   const [insights, setInsights] = useState(null);
   const [sessionId, setSessionId] = useState(null);
   const [error, setError] = useState(null);
+  const [progress, setProgress] = useState({ step: "loading", pct: 0 });
 
   const handleStartWrapped = useCallback(async (file) => {
     setError(null);
-    const { session_id } = await uploadHistory(file);
-    setSessionId(session_id);
-    const { insights: data } = await processHistory(session_id, {
-      include_per_video: false,
-    });
-    setInsights(data);
-    setPhase("slideshow");
+    setProgress({ step: "loading", pct: 3 });
+    setPhase("processing");
+    try {
+      const { session_id } = await uploadHistory(file);
+      setSessionId(session_id);
+      const data = await processWithProgress(
+        session_id,
+        (step, pct) => setProgress({ step, pct }),
+        { include_per_video: false, n_clusters: 12 },
+      );
+      setInsights({
+        ...data.insights,
+        session_id: data.session_id || session_id,
+        insights_partial: data.partial === true,
+      });
+      setPhase("slideshow");
+    } catch (e) {
+      setError(e.message || String(e));
+      setPhase("upload");
+    }
   }, []);
 
   const handleDemo = useCallback(async () => {
     setError(null);
-    const { session_id } = await startDemoSession();
-    setSessionId(session_id);
-    const { insights: data } = await processHistory(session_id, {
-      include_per_video: false,
-    });
-    setInsights(data);
-    setPhase("slideshow");
+    setProgress({ step: "loading", pct: 3 });
+    setPhase("processing");
+    try {
+      const { session_id } = await startDemoSession();
+      setSessionId(session_id);
+      const data = await processWithProgress(
+        session_id,
+        (step, pct) => setProgress({ step, pct }),
+        { include_per_video: false, n_clusters: 12 },
+      );
+      setInsights({
+        ...data.insights,
+        session_id: data.session_id || session_id,
+        insights_partial: data.partial === true,
+      });
+      setPhase("slideshow");
+    } catch (e) {
+      setError(e.message || String(e));
+      setPhase("upload");
+    }
   }, []);
 
   const slides = insights ? buildSlidesFromInsights(insights) : [];
@@ -164,6 +204,10 @@ export default function App() {
         <div className="fixed top-4 left-1/2 z-[100] max-w-md -translate-x-1/2 rounded-xl bg-red-950/90 px-4 py-3 text-sm text-red-100 shadow-xl ring-1 ring-red-500/40">
           {error}
         </div>
+      )}
+
+      {phase === "processing" && (
+        <ProcessingOverlay step={progress.step} pct={progress.pct} />
       )}
 
       {phase === "upload" && (

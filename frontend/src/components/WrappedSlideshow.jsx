@@ -85,6 +85,7 @@ export default function WrappedSlideshow({
             gradient={current.gradient}
             slideNumber={current.slideNumber}
             totalSlides={slides.length}
+            feedback={current.feedback}
           />
         </motion.div>
       </AnimatePresence>

@@ -6,3 +6,5 @@ venv/
 .env
 frontend/node_modules/
 frontend/dist/
+.cache/
+.hf-cache/

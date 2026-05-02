@@ -1,5 +1,7 @@
 import { motion } from "framer-motion";
 import { useEffect, useState } from "react";
+import { submitCategoryFeedback } from "../api";
+import { CLASSIFICATION_LABELS } from "../classificationLabels";
 
 const GRADIENTS = [
   "from-violet-900 via-purple-950 to-black",
@@ -51,10 +53,41 @@ export default function Slide({
   gradient = 0,
   slideNumber,
   totalSlides,
+  feedback,
 }) {
   const gradClass = GRADIENTS[gradient % GRADIENTS.length];
   const parsed = parseStatNumber(stat);
   const lines = (Array.isArray(body) ? body : [body]).filter(Boolean).slice(0, 3);
+
+  const [fbOpen, setFbOpen] = useState(false);
+  const [fbPick, setFbPick] = useState("entertainment");
+  const [fbMsg, setFbMsg] = useState(null);
+  const [fbLoading, setFbLoading] = useState(false);
+
+  useEffect(() => {
+    setFbPick(feedback?.wrongCategory || "entertainment");
+    setFbMsg(null);
+    setFbOpen(false);
+  }, [feedback?.title, feedback?.wrongCategory]);
+
+  async function submitFeedback() {
+    if (!feedback?.title) return;
+    setFbLoading(true);
+    setFbMsg(null);
+    try {
+      const r = await submitCategoryFeedback({
+        title: feedback.title,
+        wrongCategory: feedback.wrongCategory,
+        correctCategory: fbPick,
+      });
+      setFbMsg(r.message || "Thanks — we’ll weigh that next run.");
+      setFbOpen(false);
+    } catch (e) {
+      setFbMsg(e.message || "Could not save");
+    } finally {
+      setFbLoading(false);
+    }
+  }
 
   return (
     <div
@@ -131,6 +164,60 @@ export default function Slide({
           </motion.div>
         )}
       </div>
+
+      {feedback?.title ? (
+        <div className="pointer-events-auto absolute bottom-24 right-4 z-30 w-[min(100%,20rem)] sm:bottom-28 sm:right-8">
+          {!fbOpen ? (
+            <button
+              type="button"
+              onClick={() => {
+                setFbOpen(true);
+                setFbMsg(null);
+              }}
+              className="rounded-full border border-white/25 bg-black/45 px-3 py-1.5 text-xs font-medium text-white/90 backdrop-blur-md hover:bg-black/55"
+            >
+              Wrong category?
+            </button>
+          ) : (
+            <div className="space-y-2 rounded-xl border border-white/20 bg-black/55 p-3 shadow-lg backdrop-blur-md">
+              <p className="text-[11px] font-medium uppercase tracking-wide text-white/50">
+                Better label for this slide’s themes
+              </p>
+              <select
+                value={fbPick}
+                onChange={(e) => setFbPick(e.target.value)}
+                className="w-full rounded-lg border border-white/15 bg-zinc-900/90 px-2 py-1.5 text-sm text-white"
+              >
+                {CLASSIFICATION_LABELS.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={fbLoading}
+                  onClick={submitFeedback}
+                  className="flex-1 rounded-lg bg-white px-3 py-1.5 text-xs font-bold text-zinc-950 disabled:opacity-50"
+                >
+                  {fbLoading ? "…" : "Save"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFbOpen(false)}
+                  className="rounded-lg border border-white/20 px-3 py-1.5 text-xs text-white/80"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+          {fbMsg && !fbOpen && (
+            <p className="mt-2 text-xs text-emerald-200/90">{fbMsg}</p>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }
