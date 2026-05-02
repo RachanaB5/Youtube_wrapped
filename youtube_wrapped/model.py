@@ -1,67 +1,103 @@
 """
-Embeddings, clustering, zero-shot labels, sequence modeling, and insights.
+Embeddings, KMeans clustering, TF-IDF cluster labels, zero-shot categories, sequence drift.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.cluster import DBSCAN, KMeans
-from sklearn.metrics import pairwise_distances
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from youtube_wrapped.analyst import generate_cinematic_summary, generate_narrative_insights
-from youtube_wrapped.data import WatchRecord
-from youtube_wrapped.utils import hour_bucket_label, top_keywords_from_texts
+from youtube_wrapped.insight_generator import generate_insights as generate_ai_insights
+from youtube_wrapped.insight_generator import generate_wrapped_story
+from youtube_wrapped.sequence_model import detect_interest_shifts
+from youtube_wrapped.utils import get_time_patterns, get_top_creators
 
+logger = logging.getLogger(__name__)
 
-CATEGORIES: List[str] = [
-    "tech",
+CLASSIFICATION_LABELS: List[str] = [
+    "technology",
     "music",
     "education",
     "gaming",
     "entertainment",
-    "productivity",
+    "cooking",
+    "finance",
+    "sports",
 ]
-
-ClusterMethod = Literal["kmeans", "dbscan"]
 
 _EMBEDDER = None
 _ZERO_SHOT_PIPE = None
 
 
+def llm_insights_available() -> bool:
+    """Return True when either configured LLM insight provider is available."""
+    import os
+
+    return bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"))
+
+
+def _ensure_hf_cache_dir() -> str:
+    """Keep Hugging Face caches inside the project by default."""
+    cache_dir = os.environ.get("HF_HOME")
+    if not cache_dir:
+        cache_dir = str((Path(__file__).resolve().parent.parent / ".hf-cache").resolve())
+        os.environ.setdefault("HF_HOME", cache_dir)
+    os.environ.setdefault("TRANSFORMERS_CACHE", cache_dir)
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _zero_shot_device() -> int:
+    try:
+        if torch.cuda.is_available():
+            return 0
+    except Exception:
+        pass
+    return -1
+
+
 def _get_embedder():
-    """Lazy-load SentenceTransformer to keep import/start time low."""
     global _EMBEDDER
     if _EMBEDDER is None:
         from sentence_transformers import SentenceTransformer
 
-        _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
+        cache_dir = _ensure_hf_cache_dir()
+        logger.info("Loading SentenceTransformer all-MiniLM-L6-v2")
+        _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2", cache_folder=cache_dir)
     return _EMBEDDER
 
 
 def _get_zero_shot_pipeline():
-    """Small MNLI model suitable for CPU batching."""
     global _ZERO_SHOT_PIPE
     if _ZERO_SHOT_PIPE is None:
         from transformers import pipeline
 
-        # DistilBERT MNLI: much lighter than BART-large while remaining usable.
+        _ensure_hf_cache_dir()
+        device = _zero_shot_device()
+        logger.info("Loading zero-shot pipeline facebook/bart-large-mnli (device=%s)", device)
         _ZERO_SHOT_PIPE = pipeline(
             "zero-shot-classification",
-            model="typeform/distilbert-base-uncased-mnli",
-            device=-1,
+            model="facebook/bart-large-mnli",
+            device=device,
         )
     return _ZERO_SHOT_PIPE
 
 
-def embed_titles(titles: List[str], batch_size: int = 64) -> np.ndarray:
+def get_embeddings(titles: List[str], batch_size: int = 64) -> np.ndarray:
     """
-    Encode cleaned titles into a dense matrix (n_samples, hidden_dim).
+    Encode cleaned titles with SentenceTransformer ``all-MiniLM-L6-v2``.
+
+    Returns ``(n_samples, 384)`` float32 array (empty inputs → shape ``(0, 384)``).
     """
     if not titles:
         return np.zeros((0, 384), dtype=np.float32)
@@ -76,85 +112,67 @@ def embed_titles(titles: List[str], batch_size: int = 64) -> np.ndarray:
     return np.asarray(vectors, dtype=np.float32)
 
 
-def choose_k(n_samples: int, max_k: int = 10) -> int:
-    """Heuristic cluster count for personal-scale histories."""
-    if n_samples < 4:
-        return 2
-    k = int(np.clip(round(np.sqrt(n_samples / 3)), 2, max_k))
-    return min(k, max(2, n_samples // 2))
-
-
-def cluster_videos(
-    embeddings: np.ndarray,
-    titles: List[str],
-    method: ClusterMethod = "kmeans",
-    random_state: int = 42,
-) -> Tuple[np.ndarray, Dict[int, Dict[str, Any]]]:
+def cluster_videos(embeddings: np.ndarray, n_clusters: int = 8, random_state: int = 42) -> np.ndarray:
     """
-    Cluster rows of `embeddings` and build human-readable summaries per id.
-
-    Returns `labels` (n_samples,) and `summaries` keyed by cluster id.
+    KMeans on embedding rows. Uses ``k = min(n_clusters, n_samples)`` with ``k >= 1``.
     """
     n = embeddings.shape[0]
     if n == 0:
-        return np.array([]), {}
+        return np.array([], dtype=np.int32)
+    k = max(1, min(int(n_clusters), n))
+    logger.info("Clustering %d rows into k=%d", n, k)
+    model = KMeans(n_clusters=k, random_state=random_state, n_init="auto")
+    return model.fit_predict(embeddings).astype(np.int32)
 
-    if method == "kmeans":
-        k = choose_k(n)
-        k = min(k, n)
-        model = KMeans(n_clusters=k, random_state=random_state, n_init="auto")
-        labels = model.fit_predict(embeddings)
-    else:
-        # Scale eps with typical nearest-neighbor distance in embedding space.
-        sample = min(512, n)
-        idx = np.random.choice(n, size=sample, replace=False)
-        d = pairwise_distances(embeddings[idx], metric="cosine")
-        # Robust eps: median of small NN distances
-        np.fill_diagonal(d, np.inf)
-        nn_dist = d.min(axis=1)
-        eps = float(np.percentile(nn_dist, 25) * 1.2)
-        eps = max(eps, 0.05)
-        model = DBSCAN(metric="cosine", eps=eps, min_samples=max(2, n // 100))
-        labels = model.fit_predict(embeddings)
 
-    summaries: Dict[int, Dict[str, Any]] = {}
-    unique = sorted(set(labels.tolist()))
-    for cid in unique:
-        if cid == -1 and method == "dbscan":
-            mask = labels == cid
-            cluster_titles = [titles[i] for i in np.where(mask)[0]]
-            summaries[cid] = {
-                "cluster_id": int(cid),
-                "size": int(mask.sum()),
-                "label_keywords": top_keywords_from_texts(cluster_titles, top_k=5),
-                "cluster_label": " / ".join(top_keywords_from_texts(cluster_titles, top_k=3)) or "mixed interests",
-                "sample_titles": cluster_titles[:5],
-                "role": "noise_or_rare",
-            }
+def label_clusters(df: pd.DataFrame, labels: np.ndarray, top_n: int = 5) -> Dict[int, List[str]]:
+    """
+    For each cluster id, fit TF-IDF on that cluster's titles and return top ``top_n`` terms.
+    """
+    if df is None or df.empty or len(labels) == 0:
+        return {}
+    titles = df["title"].astype(str).tolist()
+    out: Dict[int, List[str]] = {}
+    for cid in sorted(np.unique(labels).tolist()):
+        idx = np.where(labels == cid)[0].tolist()
+        cluster_texts = [titles[i] for i in idx]
+        if not cluster_texts:
+            out[int(cid)] = []
             continue
-        mask = labels == cid
-        cluster_titles = [titles[i] for i in np.where(mask)[0]]
-        summaries[cid] = {
-            "cluster_id": int(cid),
-            "size": int(mask.sum()),
-            "label_keywords": top_keywords_from_texts(cluster_titles, top_k=5),
-            "cluster_label": " / ".join(top_keywords_from_texts(cluster_titles, top_k=3)) or "mixed interests",
-            "sample_titles": cluster_titles[:5],
-        }
-    return labels, summaries
+        try:
+            vec = TfidfVectorizer(
+                max_features=80,
+                stop_words="english",
+                token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b",
+                min_df=1,
+            )
+            tfidf = vec.fit_transform(cluster_texts)
+            scores = np.asarray(tfidf.sum(axis=0)).ravel()
+            terms = np.array(vec.get_feature_names_out())
+            if scores.size == 0:
+                out[int(cid)] = []
+                continue
+            top_idx = np.argsort(scores)[::-1][:top_n]
+            out[int(cid)] = [str(terms[i]) for i in top_idx if scores[i] > 0]
+        except ValueError as exc:
+            logger.warning("TF-IDF failed for cluster %s: %s", cid, exc)
+            out[int(cid)] = []
+    return out
 
 
-def zero_shot_categories(
+def classify_categories_scored(
     titles: List[str],
-    batch_size: int = 16,
     categories: Optional[List[str]] = None,
+    batch_size: int = 4,
 ) -> Tuple[List[str], List[float]]:
     """
-    Assign a single best category per title using zero-shot NLI.
+    Zero-shot labels per title with confidences (facebook/bart-large-mnli).
+
+    Small default batch_size keeps CPU/GPU memory predictable.
     """
     if not titles:
         return [], []
-    labels = categories or CATEGORIES
+    labels = categories or CLASSIFICATION_LABELS
     pipe = _get_zero_shot_pipeline()
     predicted: List[str] = []
     scores: List[float] = []
@@ -163,75 +181,23 @@ def zero_shot_categories(
         raw = pipe(batch, candidate_labels=labels, multi_label=False)
         items = raw if isinstance(raw, list) else [raw]
         for out in items:
-            predicted.append(out["labels"][0])
+            predicted.append(str(out["labels"][0]))
             scores.append(float(out["scores"][0]))
     return predicted, scores
 
 
-@dataclass
-class TimeAnalysisResult:
-    hourly_counts: Dict[int, int]
-    day_of_week_counts: Dict[str, int]
-    month_counts: Dict[str, int]
-    bucket_counts: Dict[str, int]
-    peak_hour: Optional[int]
-    late_night_ratio: float
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "hourly_counts": {str(k): v for k, v in sorted(self.hourly_counts.items())},
-            "day_of_week_counts": self.day_of_week_counts,
-            "month_counts": dict(sorted(self.month_counts.items())),
-            "time_bucket_counts": self.bucket_counts,
-            "peak_hour": self.peak_hour,
-            "late_night_ratio": round(self.late_night_ratio, 4),
-        }
-
-
-def analyze_time_patterns(records: List[WatchRecord]) -> TimeAnalysisResult:
+def classify_categories(titles: List[str]) -> List[str]:
     """
-    Build hour / weekday / month histograms and simple behavioral cues.
+    Zero-shot classification into the eight Wrapped categories.
+
+    Uses ``facebook/bart-large-mnli``.
     """
-    weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    hourly = {h: 0 for h in range(24)}
-    dow = {d: 0 for d in weekdays}
-    months: Dict[str, int] = {}
-    buckets: Dict[str, int] = {}
-
-    late_night = 0
-    total = 0
-    for r in records:
-        dt = r.watched_at
-        hourly[dt.hour] += 1
-        dow[weekdays[dt.weekday()]] += 1
-        mkey = dt.strftime("%Y-%m")
-        months[mkey] = months.get(mkey, 0) + 1
-        b = hour_bucket_label(dt.hour)
-        buckets[b] = buckets.get(b, 0) + 1
-        if 0 <= dt.hour < 5:
-            late_night += 1
-        total += 1
-
-    peak_hour = max(hourly, key=hourly.get) if total else None
-    late_ratio = (late_night / total) if total else 0.0
-    return TimeAnalysisResult(
-        hourly_counts=hourly,
-        day_of_week_counts=dow,
-        month_counts=months,
-        bucket_counts=buckets,
-        peak_hour=peak_hour,
-        late_night_ratio=late_ratio,
-    )
+    cats, _ = classify_categories_scored(titles)
+    return cats
 
 
 class InterestShiftLSTM(nn.Module):
-    """
-    Lightweight LSTM that compares early vs late temporal segments.
-
-    Applied to the time-ordered embedding sequence; exposes a differentiable
-    split, but at inference time we only use cosine drift between pooled
-    early / late segment representations.
-    """
+    """Lightweight LSTM comparing early vs late temporal segments of embeddings."""
 
     def __init__(self, input_dim: int, hidden_dim: int = 128, num_layers: int = 1):
         super().__init__()
@@ -246,12 +212,6 @@ class InterestShiftLSTM(nn.Module):
         self.proj = nn.Linear(hidden_dim, 64)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (batch, seq, input_dim)
-        Returns:
-            early_z, late_z: (batch, 64) projected segment means.
-        """
         x = self.input_ln(x)
         out, _ = self.lstm(x)
         t = out.size(1)
@@ -262,7 +222,6 @@ class InterestShiftLSTM(nn.Module):
 
 
 def _cosine_drift(a: np.ndarray, b: np.ndarray) -> float:
-    """1 - cosine similarity for L2-normalized vectors."""
     a = a.astype(np.float64)
     b = b.astype(np.float64)
     na = np.linalg.norm(a) + 1e-9
@@ -275,17 +234,9 @@ def sequence_interest_shift(
     embedding_matrix: np.ndarray,
     segment_fraction: float = 0.25,
 ) -> Dict[str, Any]:
-    """
-    Measure interest drift from early to late sessions.
-
-    Combines:
-      * **embedding_drift**: difference between mean embeddings of first/last
-        fractions of the timeline (interpretable, no training).
-      * **lstm_drift**: same comparison after a small LSTM temporal mix
-        (architecture satisfies sequence-model requirement; scores are auxiliary).
-    """
+    """Early vs late cosine drift on raw embeddings plus LSTM-pooled segments."""
     n, d = embedding_matrix.shape
-    out: Dict[str, Any] = {
+    result: Dict[str, Any] = {
         "sequence_length": int(n),
         "embedding_dim": int(d),
         "embedding_drift": None,
@@ -294,7 +245,7 @@ def sequence_interest_shift(
         "notes": [],
     }
     if n < 4:
-        out["notes"].append("Too few videos for a reliable trajectory; scores are approximate.")
+        result["notes"].append("Too few videos for a reliable trajectory; scores are approximate.")
         seg = max(1, n // 2)
     else:
         seg = max(1, int(round(n * segment_fraction)))
@@ -302,9 +253,8 @@ def sequence_interest_shift(
     early_emb = embedding_matrix[:seg].mean(axis=0)
     late_emb = embedding_matrix[-seg:].mean(axis=0)
     emb_drift = _cosine_drift(early_emb, late_emb)
-    out["embedding_drift"] = round(emb_drift, 4)
+    result["embedding_drift"] = round(emb_drift, 4)
 
-    # LSTM path (eval, no training — temporal mixing only)
     device = torch.device("cpu")
     lstm = InterestShiftLSTM(input_dim=d, hidden_dim=min(128, d), num_layers=1)
     lstm.eval()
@@ -314,158 +264,208 @@ def sequence_interest_shift(
         ez = early_z.cpu().numpy().squeeze()
         lz = late_z.cpu().numpy().squeeze()
         lstm_drift = _cosine_drift(ez, lz)
-    out["lstm_drift"] = round(lstm_drift, 4)
-
-    # Weight interpretable embedding drift higher for reporting.
-    combined = float(0.75 * emb_drift + 0.25 * lstm_drift)
-    out["combined_shift_score"] = round(combined, 4)
+    result["lstm_drift"] = round(lstm_drift, 4)
+    result["combined_shift_score"] = round(float(0.75 * emb_drift + 0.25 * lstm_drift), 4)
     if emb_drift < 0.02:
-        out["notes"].append("Very stable interests across the sampled window.")
+        result["notes"].append("Very stable interests across the sampled window.")
     elif emb_drift > 0.15:
-        out["notes"].append("Noticeable shift between early and late watching patterns.")
-    return out
+        result["notes"].append("Noticeable shift between early and late watching patterns.")
+    return result
 
 
-def build_insights(
-    records: List[WatchRecord],
-    embeddings: np.ndarray,
-    cluster_labels: np.ndarray,
-    cluster_summaries: Dict[int, Dict[str, Any]],
-    categories: List[str],
-    category_scores: List[float],
-    time_result: TimeAnalysisResult,
-    sequence_shift: Dict[str, Any],
-    cluster_method: str,
+def run_pipeline(
+    df: pd.DataFrame,
+    n_clusters: int = 8,
+    random_state: int = 42,
+    include_per_video: bool = True,
 ) -> Dict[str, Any]:
     """
-    Aggregate human-facing insight JSON from intermediate artifacts.
+    Full ML + aggregation pass. Expects DataFrame from ``load_watch_history``.
     """
-    titles = [r.title for r in records]
-    channels = [r.channel for r in records]
+    empty_narrative_input = {
+        "summary": {"total_videos_analyzed": 0},
+        "behavior": {"time_patterns": {}},
+        "clusters": [],
+        "per_video": [],
+    }
+    if df is None or df.empty:
+        empty = {
+            "top_categories": [],
+            "top_creators": [],
+            "clusters": [],
+            "time_patterns": get_time_patterns(pd.DataFrame()),
+            "monthly_trends": {},
+            "shift_points": [],
+            "journey_summary": "",
+            "narrative": generate_narrative_insights(empty_narrative_input),
+            "cinematic_summary": [],
+            "wrapped_story": [],
+            "behavior": {"interest_shift": {}, "late_night_heavy": False, "peak_time_bucket": None},
+            "model_artifacts": {
+                "embedding_shape": [0, 384],
+                "sentence_transformer": "all-MiniLM-L6-v2",
+                "zero_shot_model": "facebook/bart-large-mnli",
+                "classification_labels": CLASSIFICATION_LABELS,
+            },
+            "per_video": [],
+        }
+        return empty
+
+    titles = df["title"].astype(str).tolist()
+    embeddings = get_embeddings(titles)
+    labels = cluster_videos(embeddings, n_clusters=n_clusters, random_state=random_state)
+    keywords_by_cluster = label_clusters(df, labels)
+
+    try:
+        categories, cat_scores = classify_categories_scored(titles)
+    except Exception as exc:
+        logger.exception("Classification failed: %s", exc)
+        raise
+
+    time_full = get_time_patterns(df)
+    monthly = {k: int(v) for k, v in (time_full.get("month_counts") or {}).items()}
+    top_creators_rows = [{"channel": c, "watch_count": n} for c, n in get_top_creators(df, 25)]
 
     cat_counts: Dict[str, int] = {}
     cat_weighted: Dict[str, float] = {}
-    for c, s in zip(categories, category_scores):
+    for c, s in zip(categories, cat_scores):
         cat_counts[c] = cat_counts.get(c, 0) + 1
         cat_weighted[c] = cat_weighted.get(c, 0.0) + float(s)
     top_categories = sorted(
-        [{"category": k, "count": v, "avg_confidence": round(cat_weighted[k] / v, 4)} for k, v in cat_counts.items()],
+        [
+            {"category": k, "count": v, "avg_confidence": round(cat_weighted[k] / v, 4)}
+            for k, v in cat_counts.items()
+        ],
         key=lambda x: x["count"],
         reverse=True,
     )
 
-    ch_counts: Dict[str, int] = {}
-    for ch in channels:
-        ch_counts[ch] = ch_counts.get(ch, 0) + 1
-    top_creators = sorted(
-        [{"channel": k, "watch_count": v} for k, v in ch_counts.items()],
-        key=lambda x: x["watch_count"],
-        reverse=True,
-    )[:25]
-
-    cluster_list = [dict(v) for _, v in sorted(cluster_summaries.items(), key=lambda kv: kv[0])]
-
-    peak_bucket = max(time_result.bucket_counts, key=time_result.bucket_counts.get) if records else None
-    date_range = {
-        "start": records[0].watched_at.isoformat(),
-        "end": records[-1].watched_at.isoformat(),
-    } if records else None
-    unique_channels = len(set(channels))
-    unique_categories = len(set(categories))
-
-    return {
-        "summary": {
-            "total_videos_analyzed": len(records),
-            "clustering_method": cluster_method,
-            "date_range": date_range,
-            "unique_channels": unique_channels,
-            "unique_categories": unique_categories,
-            "top_categories": top_categories[:6],
-            "top_creators": top_creators[:10],
-        },
-        "behavior": {
-            "time_patterns": time_result.to_dict(),
-            "peak_time_bucket": peak_bucket,
-            "late_night_heavy": time_result.late_night_ratio >= 0.15,
-            "interest_shift": sequence_shift,
-        },
-        "clusters": cluster_list,
-        "cluster_summaries": [
-            {
-                "cluster_id": cluster["cluster_id"],
-                "cluster_label": cluster.get("cluster_label", "mixed interests"),
-                "keywords": cluster.get("label_keywords", []),
-                "size": cluster.get("size", 0),
-                "sample_titles": cluster.get("sample_titles", []),
-            }
-            for cluster in cluster_list
-        ],
-        "per_video": [
-            {
-                "title": titles[i],
-                "channel": channels[i],
-                "timestamp_iso": records[i].watched_at.isoformat(),
-                "cluster_id": int(cluster_labels[i]) if len(cluster_labels) else -1,
-                "category": categories[i] if i < len(categories) else None,
-                "category_confidence": round(category_scores[i], 4) if i < len(category_scores) else None,
-            }
-            for i in range(len(records))
-        ],
-    }
-
-
-def run_pipeline(
-    records: List[WatchRecord],
-    cluster_method: ClusterMethod = "kmeans",
-    random_state: int = 42,
-) -> Dict[str, Any]:
-    """
-    End-to-end processing for a list of `WatchRecord` instances.
-
-    Returns a dict suitable for JSON serialization (with per-video detail).
-    """
-    if not records:
-        return {
-            "summary": {"total_videos_analyzed": 0, "error": "no_records"},
-            "behavior": {},
-            "clusters": [],
-            "per_video": [],
-            "narrative": generate_narrative_insights(
-                {"summary": {"total_videos_analyzed": 0}, "behavior": {}, "clusters": [], "per_video": []}
-            ),
-        }
-
-    titles = [r.title for r in records]
-    embeddings = embed_titles(titles)
-    labels, summaries = cluster_videos(embeddings, titles, method=cluster_method, random_state=random_state)
-    categories, cat_scores = zero_shot_categories(titles)
-    time_result = analyze_time_patterns(records)
+    bucket_counts = time_full.get("time_bucket_counts") or {}
+    peak_bucket = max(bucket_counts, key=bucket_counts.get) if bucket_counts else None
     seq_shift = sequence_interest_shift(embeddings)
 
-    insights = build_insights(
-        records=records,
+    cluster_list: List[Dict[str, Any]] = []
+    for cid in sorted(keywords_by_cluster.keys()):
+        mask = labels == cid
+        size = int(mask.sum())
+        kws = keywords_by_cluster.get(cid, [])
+        sample_titles = df.loc[mask, "title"].head(5).tolist()
+        cluster_list.append(
+            {
+                "cluster_id": int(cid),
+                "size": size,
+                "keywords": kws,
+                "label_keywords": kws,
+                "cluster_label": " / ".join(kws[:3]) if kws else "mixed interests",
+                "sample_titles": sample_titles,
+            }
+        )
+
+    per_video: List[Dict[str, Any]] = []
+    if include_per_video:
+        for i in range(len(df)):
+            row = df.iloc[i]
+            per_video.append(
+                {
+                    "title": str(row["title"]),
+                    "channel": str(row["channel"]),
+                    "timestamp_iso": pd.Timestamp(row["timestamp"]).isoformat(),
+                    "cluster_id": int(labels[i]) if len(labels) else -1,
+                    "category": categories[i] if i < len(categories) else None,
+                    "category_confidence": round(cat_scores[i], 4) if i < len(cat_scores) else None,
+                }
+            )
+
+    core_insights_for_narrative = {
+        "summary": {
+            "total_videos_analyzed": int(len(df)),
+            "top_categories": top_categories,
+            "top_creators": top_creators_rows[:10],
+        },
+        "behavior": {
+            "time_patterns": time_full,
+            "peak_time_bucket": peak_bucket,
+            "late_night_heavy": float(time_full.get("late_night_ratio") or 0) >= 0.15,
+            "interest_shift": seq_shift,
+        },
+        "clusters": cluster_list,
+        "per_video": per_video,
+    }
+    cluster_name_map = {
+        int(cluster["cluster_id"]): str(cluster.get("cluster_label") or "mixed interests")
+        for cluster in cluster_list
+    }
+    shift_points, journey_summary = detect_interest_shifts(
+        df=df,
         embeddings=embeddings,
         cluster_labels=labels,
-        cluster_summaries=summaries,
-        categories=categories,
-        category_scores=cat_scores,
-        time_result=time_result,
-        sequence_shift=seq_shift,
-        cluster_method=cluster_method,
+        cluster_label_names=cluster_name_map,
     )
-    # Avoid huge responses in some deployments — keep per_video optional at route layer if needed.
-    insights["model_artifacts"] = {
-        "embedding_shape": [int(x) for x in embeddings.shape],
-        "embedding_matrix": embeddings.tolist(),
-        "sentence_transformer": "all-MiniLM-L6-v2",
-        "zero_shot_model": "typeform/distilbert-base-uncased-mnli",
+    narrative = generate_narrative_insights(core_insights_for_narrative)
+    top_cat_name = top_categories[0]["category"] if top_categories else ""
+    cinematic = generate_cinematic_summary(
+        top_category=top_cat_name,
+        top_creators=top_creators_rows,
+        peak_time=str(peak_bucket or time_full.get("peak_hour") or "unknown"),
+        cluster_summary=cluster_list,
+        persona=narrative.get("persona", ""),
+    )
+
+    time_patterns_api = {
+        "peak_hour": time_full.get("peak_hour"),
+        "peak_day": time_full.get("peak_day"),
+        "late_night_percentage": time_full.get("late_night_percentage"),
+        "late_night_ratio": time_full.get("late_night_ratio"),
+        "most_active_month": time_full.get("most_active_month"),
+        "hourly_counts": time_full.get("hourly_counts"),
+        "day_of_week_counts": time_full.get("day_of_week_counts"),
+        "month_counts": time_full.get("month_counts"),
+        "time_bucket_counts": time_full.get("time_bucket_counts"),
     }
-    insights["narrative"] = generate_narrative_insights(insights)
-    insights["cinematic_summary"] = generate_cinematic_summary(
-        top_category=(insights["summary"]["top_categories"][0]["category"] if insights["summary"]["top_categories"] else ""),
-        top_creators=insights["summary"]["top_creators"],
-        peak_time=(insights["behavior"].get("peak_time_bucket") or "unknown"),
-        cluster_summary=insights["cluster_summaries"],
-        persona=insights["narrative"].get("persona", ""),
-    )
-    return insights
+
+    result = {
+        "top_categories": top_categories,
+        "top_creators": top_creators_rows[:10],
+        "clusters": cluster_list,
+        "time_patterns": time_patterns_api,
+        "monthly_trends": monthly,
+        "monthly_trends_sorted": [{"month": m, "count": c} for m, c in sorted(monthly.items())],
+        "shift_points": shift_points,
+        "journey_summary": journey_summary,
+        "narrative": narrative,
+        "cinematic_summary": cinematic,
+        "behavior": {
+            "interest_shift": seq_shift,
+            "late_night_heavy": core_insights_for_narrative["behavior"]["late_night_heavy"],
+            "peak_time_bucket": peak_bucket,
+        },
+        "summary": core_insights_for_narrative["summary"],
+        "model_artifacts": {
+            "embedding_shape": [int(x) for x in embeddings.shape],
+            "sentence_transformer": "all-MiniLM-L6-v2",
+            "zero_shot_model": "facebook/bart-large-mnli",
+            "classification_labels": CLASSIFICATION_LABELS,
+            "n_clusters_effective": int(np.unique(labels).size),
+        },
+        "per_video": per_video,
+    }
+    if llm_insights_available():
+        ai_input = {
+            "summary": result["summary"],
+            "top_categories": result["top_categories"],
+            "top_creators": result["top_creators"],
+            "clusters": result["clusters"],
+            "time_patterns": result["time_patterns"],
+            "monthly_trends": result["monthly_trends"],
+            "journey_summary": result["journey_summary"],
+        }
+        try:
+            result["ai_insights"] = generate_ai_insights(ai_input)
+            result["wrapped_story"] = generate_wrapped_story(result["ai_insights"], ai_input)
+        except Exception as exc:
+            logger.warning("Skipping external AI insights: %s", exc)
+            result["ai_insights_error"] = str(exc)
+            result["wrapped_story"] = []
+    else:
+        result["wrapped_story"] = []
+    return result

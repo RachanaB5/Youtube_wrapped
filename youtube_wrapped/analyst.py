@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Categories treated as "utility / learning" vs "reward / play" for persona axes.
-_LEARN_BIAS = frozenset({"education", "tech", "productivity"})
-_PLAY_BIAS = frozenset({"entertainment", "gaming", "music"})
+_LEARN_BIAS = frozenset({"technology", "education", "finance", "cooking", "tech", "productivity"})
+_PLAY_BIAS = frozenset({"entertainment", "gaming", "music", "sports"})
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
